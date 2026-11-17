@@ -30,18 +30,33 @@ variable "kms_deletion_window_in_days" {
   type        = number
   description = "Waiting period before a module-created KMS key is deleted."
   default     = 30
+
+  validation {
+    condition     = var.kms_deletion_window_in_days >= 7 && var.kms_deletion_window_in_days <= 30
+    error_message = "kms_deletion_window_in_days must be between 7 and 30."
+  }
 }
 
 variable "noncurrent_version_expiration_days" {
   type        = number
   description = "Days to keep old (noncurrent) versions of state files before they expire."
   default     = 90
+
+  validation {
+    condition     = var.noncurrent_version_expiration_days >= 1
+    error_message = "noncurrent_version_expiration_days must be at least 1."
+  }
 }
 
 variable "noncurrent_versions_to_keep" {
   type        = number
   description = "Number of most recent noncurrent versions always kept regardless of age."
   default     = 10
+
+  validation {
+    condition     = var.noncurrent_versions_to_keep >= 1 && var.noncurrent_versions_to_keep <= 100
+    error_message = "noncurrent_versions_to_keep must be between 1 and 100."
+  }
 }
 
 variable "access_log_bucket" {
@@ -66,6 +81,11 @@ variable "access_prefixes" {
   type        = list(string)
   description = "Key prefixes (without leading/trailing slash) the access policy is scoped to, e.g. [\"dev\", \"prod/network\"]. Empty list = whole bucket."
   default     = []
+
+  validation {
+    condition     = alltrue([for p in var.access_prefixes : can(regex("^[^/].*[^/]$|^[^/]$", p))])
+    error_message = "access_prefixes entries must not start or end with a slash."
+  }
 }
 
 variable "tags" {

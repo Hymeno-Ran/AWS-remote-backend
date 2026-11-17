@@ -23,7 +23,7 @@ Module tái sử dụng để tạo **S3 remote backend** cho Terraform. Mỗi l
 
 ```hcl
 module "state_backend" {
-  source = "git::ssh://git@github.com/<org>/terraform-aws-state-backend.git?ref=v1.0.0"
+  source = "git::ssh://git@github.com/Hymeno-Ran/AWS-remote-backend.git?ref=v1.0.0"
 
   project = "tf-module"
 }
@@ -33,7 +33,7 @@ module "state_backend" {
 
 ```hcl
 module "state_backend" {
-  source   = "git::ssh://git@github.com/<org>/terraform-aws-state-backend.git?ref=v1.0.0"
+  source   = "git::ssh://git@github.com/Hymeno-Ran/AWS-remote-backend.git?ref=v1.0.0"
   for_each = toset(["tf-module", "other-app"])
 
   project = each.key
@@ -145,6 +145,32 @@ Mỗi dự án đã có bucket riêng nên key không cần chứa tên dự án
 
 - Module: Terraform `>= 1.5.0`, AWS provider `>= 6.0`
 - Dự án dùng `use_lockfile = true`: Terraform `>= 1.10.0`
+- Chạy test (`terraform test`): Terraform `>= 1.7.0`
+
+### Điều kiện để build
+
+Danh sách IAM permission đầy đủ và điều kiện riêng của từng resource được ghi ngay trong comment ở [main.tf](main.tf). Tóm tắt:
+
+| Resource | Điều kiện |
+|---|---|
+| Toàn module | Principal chạy apply có quyền trên KMS, S3, IAM (và DynamoDB nếu bật); SCP của Organizations không chặn các action/region này |
+| S3 bucket | Tên **duy nhất trên toàn AWS**, tối đa 63 ký tự. Nếu bị `BucketAlreadyExists` thì đặt `bucket_name` khác |
+| KMS alias / IAM policy / DynamoDB table | Tên phải duy nhất. Không gọi module 2 lần cùng `project` trong cùng một region |
+| `kms_key_arn` (BYO key) | Symmetric key, **cùng region** với bucket. Key policy phải cho phép các role dùng backend `GenerateDataKey`/`Decrypt` |
+| `access_log_bucket` | Phải có sẵn, cùng account và region, dùng SSE-S3 (không hỗ trợ SSE-KMS), và bucket policy cho phép `logging.s3.amazonaws.com` ghi vào |
+| DynamoDB table | Bật `deletion_protection`: muốn destroy thì phải tắt nó và apply trước |
+| IAM policy | Module chỉ tạo policy, **bạn tự attach** vào role CI/developer. Nếu giới hạn prefix mà có dùng workspace thì thêm `env:` vào `access_prefixes` |
+
+## Test
+
+Test unit dùng mock provider, không cần AWS credentials:
+
+```bash
+terraform init -backend=false
+terraform test
+```
+
+Các test case gồm: tên mặc định, giới hạn prefix, dùng KMS key có sẵn kèm DynamoDB, validate tên project, tên bucket vượt 63 ký tự, prefix sai định dạng.
 
 ## Lưu ý
 
