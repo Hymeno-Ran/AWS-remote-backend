@@ -1,5 +1,6 @@
-# One bootstrap stack, one isolated backend (bucket + KMS key + policy)
-# per project. Add a project to the map and re-apply.
+# One bootstrap stack, one isolated backend (bucket + optional KMS key +
+# policy) per project/environment. Add an entry to the map and re-apply.
+# encryption_type can differ per entry, e.g. KMS for prod, SSE-S3 for SIT.
 
 terraform {
   required_version = ">= 1.10.0"
@@ -18,11 +19,13 @@ provider "aws" {
 
 variable "projects" {
   type = map(object({
-    tags = optional(map(string), {})
+    encryption_type = optional(string, "customer-kms")
+    tags            = optional(map(string), {})
   }))
   default = {
-    "tf-module" = { tags = { Team = "platform" } }
-    "other-app" = { tags = { Team = "app" } }
+    "tf-module-prod" = { tags = { Team = "platform" } }
+    "tf-module-sit"  = { encryption_type = "sse-s3", tags = { Team = "platform" } }
+    "other-app"      = { encryption_type = "aws-kms", tags = { Team = "app" } }
   }
 }
 
@@ -30,8 +33,9 @@ module "state_backend" {
   source   = "../.."
   for_each = var.projects
 
-  project = each.key
-  tags    = each.value.tags
+  project         = each.key
+  encryption_type = each.value.encryption_type
+  tags            = each.value.tags
 }
 
 output "backend_configs" {

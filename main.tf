@@ -8,6 +8,7 @@
 #       kms:CreateKey, kms:CreateAlias, kms:EnableKeyRotation, kms:TagResource,
 #       kms:DescribeKey, kms:GetKeyPolicy, kms:GetKeyRotationStatus,
 #       kms:ListResourceTags, kms:ScheduleKeyDeletion, kms:DeleteAlias
+#         (only when encryption_type = customer-kms and no kms_key_arn)
 #       s3:CreateBucket, s3:DeleteBucket, s3:Put*/Get* on the bucket config
 #         (Versioning, Encryption, PublicAccessBlock, OwnershipControls,
 #          LifecycleConfiguration, BucketPolicy, BucketLogging, BucketTagging)
@@ -34,8 +35,16 @@ locals {
   account_id  = data.aws_caller_identity.current.account_id
   region      = data.aws_region.current.region
   bucket_name = coalesce(var.bucket_name, "${var.project}-tfstate-${local.account_id}-${local.region}")
-  kms_key_arn = var.kms_key_arn != null ? var.kms_key_arn : aws_kms_key.state[0].arn
   lock_table  = "${var.project}-tfstate-lock"
+
+  # Encryption selection (see var.encryption_type).
+  use_cmk        = var.encryption_type == "customer-kms"
+  create_kms_key = local.use_cmk && var.kms_key_arn == null
+  # Customer managed key ARN; null for aws-kms (S3/DynamoDB pick the AWS
+  # managed key themselves) and for sse-s3.
+  kms_key_arn = !local.use_cmk ? null : (
+    var.kms_key_arn != null ? var.kms_key_arn : try(aws_kms_key.state[0].arn, null)
+  )
 
   common_tags = merge(var.tags, {
     Project   = var.project
@@ -56,7 +65,7 @@ locals {
 # KMS
 # ---------------------------------------------------------------------------
 
-# Created only when var.kms_key_arn is null.
+# Created only when encryption_type = customer-kms and var.kms_key_arn is null.
 # Requires:
 #   - kms:CreateKey, kms:EnableKeyRotation, kms:TagResource.
 #   - No explicit key policy is set, so AWS applies the default policy that
@@ -67,7 +76,7 @@ locals {
 #     state encrypted with it becomes unreadable once the key is deleted.
 #   - Costs ~1 USD/month per key.
 resource "aws_kms_key" "state" {
-  count = var.kms_key_arn == null ? 1 : 0
+  count = local.create_kms_key ? 1 : 0
 
   description             = "Terraform state encryption - ${var.project}"
   enable_key_rotation     = true
@@ -81,7 +90,7 @@ resource "aws_kms_key" "state" {
 #   - Alias name must be unique per account + region: two modules with the
 #     same `project` in the same region will collide.
 resource "aws_kms_alias" "state" {
-  count = var.kms_key_arn == null ? 1 : 0
+  count = local.create_kms_key ? 1 : 0
 
   name          = "alias/${var.project}-tfstate"
   target_key_id = aws_kms_key.state[0].key_id
@@ -112,6 +121,13 @@ resource "aws_s3_bucket" "state" {
     precondition {
       condition     = length(local.bucket_name) <= 63
       error_message = "Bucket name \"${local.bucket_name}\" exceeds 63 characters. Shorten project or set bucket_name explicitly."
+    }
+
+    # Cross-variable check kept here (not in variables.tf) so the module
+    # still supports Terraform < 1.9.
+    precondition {
+      condition     = var.kms_key_arn == null || local.use_cmk
+      error_message = "kms_key_arn can only be set when encryption_type = \"customer-kms\"."
     }
   }
 }
@@ -152,22 +168,31 @@ resource "aws_s3_bucket_versioning" "state" {
 }
 
 # Requires: s3:PutEncryptionConfiguration.
-# When var.kms_key_arn is set (bring-your-own key):
-#   - The key must be a symmetric key in the SAME region as the bucket.
-#   - Its key policy must allow the principals that use the backend (and the
-#     principal running this apply) kms:GenerateDataKey, kms:Decrypt,
-#     kms:DescribeKey - either directly or by delegating to IAM.
-#   - For a key in another account, the IAM policy alone is not enough: the
-#     key policy must explicitly grant those accounts/roles.
+# Per encryption_type:
+#   customer-kms - aws:kms with the customer managed key.
+#     When var.kms_key_arn is set (bring-your-own key):
+#       - Must be a symmetric key in the SAME region as the bucket.
+#       - Its key policy must allow the principals that use the backend (and
+#         the principal running this apply) kms:GenerateDataKey, kms:Decrypt,
+#         kms:DescribeKey - either directly or by delegating to IAM.
+#       - For a key in another account, the IAM policy alone is not enough:
+#         the key policy must explicitly grant those accounts/roles.
+#   aws-kms - aws:kms without a key ID, so S3 uses the AWS managed key
+#     aws/s3 (auto-created on first use). Its key policy already allows every
+#     principal in this account via S3, so no KMS IAM permission is needed.
+#     Cannot be shared cross-account and its key policy cannot be changed.
+#   sse-s3 - AES256, keys fully handled by S3. No KMS cost, but anyone with
+#     s3:GetObject on the state can read it (no second layer of access
+#     control, no CloudTrail decrypt events).
 resource "aws_s3_bucket_server_side_encryption_configuration" "state" {
   bucket = aws_s3_bucket.state.id
 
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm     = "aws:kms"
+      sse_algorithm     = var.encryption_type == "sse-s3" ? "AES256" : "aws:kms"
       kms_master_key_id = local.kms_key_arn
     }
-    bucket_key_enabled = true
+    bucket_key_enabled = var.encryption_type != "sse-s3"
   }
 }
 
@@ -261,8 +286,11 @@ resource "aws_s3_bucket_policy" "state" {
 # Requires:
 #   - dynamodb:CreateTable, dynamodb:DescribeTable, dynamodb:TagResource,
 #     dynamodb:UpdateContinuousBackups (for point-in-time recovery).
-#   - Encryption uses the state KMS key: the caller needs kms:CreateGrant and
-#     kms:DescribeKey on that key (DynamoDB creates a grant at table creation).
+#   - Encryption follows encryption_type:
+#       customer-kms - the state KMS key; the caller needs kms:CreateGrant and
+#                      kms:DescribeKey on it (DynamoDB creates a grant).
+#       aws-kms      - AWS managed key aws/dynamodb.
+#       sse-s3       - AWS owned key (free, the DynamoDB default).
 #   - Table name must be unique per account + region.
 # Notes:
 #   - deletion_protection_enabled = true: to destroy, first set it to false
@@ -285,8 +313,9 @@ resource "aws_dynamodb_table" "lock" {
     enabled = true
   }
 
+  # enabled = false means "AWS owned key", not "unencrypted".
   server_side_encryption {
-    enabled     = true
+    enabled     = var.encryption_type != "sse-s3"
     kms_key_arn = local.kms_key_arn
   }
 
@@ -324,10 +353,15 @@ data "aws_iam_policy_document" "access" {
     resources = local.object_arns
   }
 
-  statement {
-    sid       = "UseStateKmsKey"
-    actions   = ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
-    resources = [local.kms_key_arn]
+  # Only for customer-kms: the aws/s3 managed key already trusts the account
+  # via S3, and sse-s3 uses no KMS at all.
+  dynamic "statement" {
+    for_each = local.use_cmk ? [1] : []
+    content {
+      sid       = "UseStateKmsKey"
+      actions   = ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
+      resources = [local.kms_key_arn]
+    }
   }
 
   dynamic "statement" {

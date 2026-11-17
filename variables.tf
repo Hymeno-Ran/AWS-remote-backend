@@ -20,9 +20,25 @@ variable "force_destroy" {
   default     = false
 }
 
+variable "encryption_type" {
+  type        = string
+  description = <<-EOT
+    How the state is encrypted at rest:
+      customer-kms - customer managed KMS key, created by the module or passed via kms_key_arn (default, recommended for prod)
+      aws-kms      - AWS managed key aws/s3 (no key to manage, no monthly key fee)
+      sse-s3       - SSE-S3 / AES256, no KMS at all (cheapest, e.g. SIT/dev)
+  EOT
+  default     = "customer-kms"
+
+  validation {
+    condition     = contains(["customer-kms", "aws-kms", "sse-s3"], var.encryption_type)
+    error_message = "encryption_type must be one of: customer-kms, aws-kms, sse-s3."
+  }
+}
+
 variable "kms_key_arn" {
   type        = string
-  description = "Existing KMS key ARN for bucket encryption. When null, the module creates a dedicated key."
+  description = "Existing customer managed KMS key ARN. Only valid with encryption_type = customer-kms; when null, the module creates a dedicated key."
   default     = null
 }
 
